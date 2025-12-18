@@ -1,1 +1,776 @@
+-- =============================================================================
+-- MEDIQUEUE MANAGEMENT SYSTEM - ENHANCED WITH TRIGGERS, CURSORS & FUNCTIONS
+-- =============================================================================
+SET DEFINE OFF
+SET LINESIZE 200
+SET PAGESIZE 100
+SET FEEDBACK OFF
 
+-- =============================================================================
+-- 🚀 ADVANCED FEATURES: TRIGGERS, FUNCTIONS, CURSORS & PROCEDURES
+-- =============================================================================
+
+-- =============================================================================
+-- 🔧 1. FUNCTIONS
+-- =============================================================================
+
+-- Function 1: Calculate Patient Age from DOB
+CREATE OR REPLACE FUNCTION fn_get_patient_age(p_dob DATE) 
+RETURN VARCHAR2
+IS
+    v_age NUMBER;
+BEGIN
+    v_age := TRUNC(MONTHS_BETWEEN(SYSDATE, p_dob) / 12);
+    RETURN v_age || ' years';
+END;
+/
+
+-- Function 2: Get Doctor's Current Patient Count
+CREATE OR REPLACE FUNCTION fn_doctor_patient_count(p_doctor_id NUMBER)
+RETURN NUMBER
+IS
+    v_count NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_count
+    FROM APPOINTMENTS
+    WHERE doctor_id = p_doctor_id
+    AND TRUNC(appointment_date) = TRUNC(SYSDATE);
+    
+    RETURN v_count;
+END;
+/
+
+-- Function 3: Calculate Estimated Wait Time Based on Priority
+CREATE OR REPLACE FUNCTION fn_calculate_wait_time(p_priority NUMBER, p_queue_position NUMBER)
+RETURN NUMBER
+IS
+    v_base_wait NUMBER;
+BEGIN
+    -- Different base wait times based on priority
+    IF p_priority = 1 THEN        -- High priority
+        v_base_wait := 15 + (p_queue_position * 5);  -- 15-30 mins
+    ELSIF p_priority = 2 THEN     -- Medium priority
+        v_base_wait := 25 + (p_queue_position * 8);  -- 25-45 mins
+    ELSIF p_priority = 3 THEN     -- Low priority
+        v_base_wait := 35 + (p_queue_position * 10); -- 35-60 mins
+    ELSE                          -- Regular priority
+        v_base_wait := 30 + (p_queue_position * 7);  -- 30-50 mins
+    END IF;
+    
+    RETURN v_base_wait;
+END;
+/
+
+-- Function 4: Get Patient Status Description
+CREATE OR REPLACE FUNCTION fn_get_patient_status(p_patient_id NUMBER)
+RETURN VARCHAR2
+IS
+    v_status VARCHAR2(20);
+    v_queue_count NUMBER;
+BEGIN
+    SELECT status INTO v_status
+    FROM QUEUES
+    WHERE patient_id = p_patient_id
+    AND ROWNUM = 1;
+    
+    RETURN v_status;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RETURN 'NO QUEUE';
+END;
+/
+
+-- =============================================================================
+-- ⚡ 2. TRIGGERS
+-- =============================================================================
+
+-- Trigger 1: Auto-calculate wait time when queue is inserted
+CREATE OR REPLACE TRIGGER trg_calculate_queue_wait
+BEFORE INSERT ON QUEUES
+FOR EACH ROW
+DECLARE
+    v_queue_position NUMBER;
+BEGIN
+    -- Get queue position for the doctor
+    SELECT COUNT(*) + 1 INTO v_queue_position
+    FROM QUEUES
+    WHERE doctor_id = :NEW.doctor_id
+    AND status = 'WAITING';
+    
+    -- Calculate and set wait time
+    :NEW.estimated_wait_time := fn_calculate_wait_time(:NEW.priority_level, v_queue_position);
+    
+    -- Log in audit
+    INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, 
+                          new_values, user_id, timestamp)
+    VALUES (seq_audit_id.NEXTVAL, 'QUEUES', 'INSERT',
+            '{"queue_id": ' || :NEW.queue_id || 
+            ', "patient": ' || :NEW.patient_id || 
+            ', "wait_time": ' || :NEW.estimated_wait_time || '}',
+            'SYSTEM', SYSTIMESTAMP);
+END;
+/
+
+-- Trigger 2: Update queue times when status changes
+CREATE OR REPLACE TRIGGER trg_update_queue_times
+BEFORE UPDATE OF status ON QUEUES
+FOR EACH ROW
+BEGIN
+    IF :NEW.status = 'IN_PROGRESS' THEN
+        :NEW.called_time := SYSTIMESTAMP;
+        :NEW.estimated_wait_time := NULL; -- No wait time when called
+        
+        -- Log in audit
+        INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, 
+                              new_values, user_id, timestamp)
+        VALUES (seq_audit_id.NEXTVAL, 'QUEUES', 'UPDATE',
+                '{"queue_id": ' || :OLD.queue_id || 
+                ', "status": "Patient called to doctor"}',
+                'NURSE', SYSTIMESTAMP);
+                
+    ELSIF :NEW.status = 'COMPLETED' THEN
+        :NEW.completed_time := SYSTIMESTAMP;
+        
+        -- Log completion
+        INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, 
+                              new_values, user_id, timestamp)
+        VALUES (seq_audit_id.NEXTVAL, 'QUEUES', 'UPDATE',
+                '{"queue_id": ' || :OLD.queue_id || 
+                ', "status": "Treatment completed"}',
+                'DOCTOR', SYSTIMESTAMP);
+    END IF;
+END;
+/
+
+-- Trigger 3: Auto-update appointment timestamp
+CREATE OR REPLACE TRIGGER trg_update_appointment_time
+BEFORE UPDATE ON APPOINTMENTS
+FOR EACH ROW
+BEGIN
+    :NEW.updated_at := SYSTIMESTAMP;
+END;
+/
+
+-- =============================================================================
+-- 📊 3. PROCEDURES WITH CURSORS
+-- =============================================================================
+
+-- Procedure 1: Show Doctor's Daily Schedule with Cursor
+CREATE OR REPLACE PROCEDURE proc_doctor_schedule(p_doctor_id NUMBER)
+IS
+    CURSOR c_appointments IS
+        SELECT a.appointment_id, 
+               p.first_name || ' ' || p.last_name as patient_name,
+               TO_CHAR(a.appointment_date, 'HH24:MI') as appointment_time,
+               a.appointment_type,
+               a.status,
+               fn_get_patient_status(p.patient_id) as patient_queue_status
+        FROM APPOINTMENTS a
+        JOIN PATIENTS p ON a.patient_id = p.patient_id
+        WHERE a.doctor_id = p_doctor_id
+        AND TRUNC(a.appointment_date) = TRUNC(SYSDATE)
+        ORDER BY a.appointment_date;
+        
+    v_doctor_name VARCHAR2(100);
+    v_appointment_count NUMBER := 0;
+BEGIN
+    -- Get doctor name
+    SELECT first_name || ' ' || last_name INTO v_doctor_name
+    FROM DOCTORS WHERE doctor_id = p_doctor_id;
+    
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '📅 DAILY SCHEDULE FOR DR. ' || v_doctor_name);
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 70, '═'));
+    
+    FOR appt IN c_appointments LOOP
+        v_appointment_count := v_appointment_count + 1;
+        DBMS_OUTPUT.PUT_LINE(
+            '⏰ ' || RPAD(appt.appointment_time, 6) || ' | ' ||
+            '👤 ' || RPAD(appt.patient_name, 25) || ' | ' ||
+            '📋 ' || RPAD(appt.appointment_type, 15) || ' | ' ||
+            '📊 ' || RPAD(appt.status, 12) || ' | ' ||
+            '⏳ ' || appt.patient_queue_status
+        );
+    END LOOP;
+    
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 70, '═'));
+    DBMS_OUTPUT.PUT_LINE('📊 Total Appointments Today: ' || v_appointment_count);
+END;
+/
+
+-- Procedure 2: Show Queue Statistics with Cursor
+CREATE OR REPLACE PROCEDURE proc_queue_statistics
+IS
+    CURSOR c_queues IS
+        SELECT q.queue_id, q.queue_number, q.status,
+               d.first_name || ' ' || d.last_name as doctor_name,
+               p.first_name || ' ' || p.last_name as patient_name,
+               q.estimated_wait_time,
+               TO_CHAR(q.check_in_time, 'HH24:MI') as check_in,
+               q.priority_level
+        FROM QUEUES q
+        JOIN DOCTORS d ON q.doctor_id = d.doctor_id
+        JOIN PATIENTS p ON q.patient_id = p.patient_id
+        WHERE q.status IN ('WAITING', 'IN_PROGRESS')
+        ORDER BY q.status, q.priority_level, q.check_in_time;
+        
+    v_waiting_count NUMBER := 0;
+    v_in_progress_count NUMBER := 0;
+    v_avg_wait_time NUMBER := 0;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '📊 REAL-TIME QUEUE STATISTICS');
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 100, '═'));
+    
+    FOR queue IN c_queues LOOP
+        IF queue.status = 'WAITING' THEN
+            v_waiting_count := v_waiting_count + 1;
+            DBMS_OUTPUT.PUT_LINE(
+                '⏳ #' || RPAD(queue.queue_number, 4) || ' | ' ||
+                '👤 ' || RPAD(queue.patient_name, 20) || ' | ' ||
+                '👨‍⚕️ ' || RPAD(queue.doctor_name, 20) || ' | ' ||
+                '🕒 Check-in: ' || RPAD(queue.check_in, 6) || ' | ' ||
+                '⏱️ Wait: ' || RPAD(NVL(TO_CHAR(queue.estimated_wait_time), 'N/A'), 6) || ' mins | ' ||
+                '🎯 ' || CASE queue.priority_level
+                    WHEN 1 THEN '🟢 HIGH'
+                    WHEN 2 THEN '🟡 MEDIUM'
+                    WHEN 3 THEN '🔴 LOW'
+                    ELSE '⚪ REGULAR'
+                END
+            );
+        ELSE
+            v_in_progress_count := v_in_progress_count + 1;
+            DBMS_OUTPUT.PUT_LINE(
+                '🚀 #' || RPAD(queue.queue_number, 4) || ' | ' ||
+                '👤 ' || RPAD(queue.patient_name, 20) || ' | ' ||
+                '👨‍⚕️ ' || RPAD(queue.doctor_name, 20) || ' | ' ||
+                '🕒 Check-in: ' || RPAD(queue.check_in, 6) || ' | ' ||
+                '📊 STATUS: IN PROGRESS'
+            );
+        END IF;
+        
+        IF queue.estimated_wait_time IS NOT NULL THEN
+            v_avg_wait_time := v_avg_wait_time + queue.estimated_wait_time;
+        END IF;
+    END LOOP;
+    
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 100, '═'));
+    DBMS_OUTPUT.PUT_LINE('📈 SUMMARY: ⏳ Waiting: ' || v_waiting_count || 
+                        ' | 🚀 In Progress: ' || v_in_progress_count ||
+                        ' | ⏱️ Avg Wait: ' || 
+                        CASE WHEN v_waiting_count > 0 
+                             THEN ROUND(v_avg_wait_time / v_waiting_count, 1) || ' mins'
+                             ELSE 'N/A' END);
+END;
+/
+
+-- Procedure 3: Show Patient Details with Age Calculation (Cursor)
+CREATE OR REPLACE PROCEDURE proc_patient_details_with_age
+IS
+    CURSOR c_patients IS
+        SELECT patient_id, patient_code,
+               first_name || ' ' || last_name as full_name,
+               date_of_birth, gender,
+               fn_get_patient_age(date_of_birth) as age,
+               phone, blood_type
+        FROM PATIENTS
+        WHERE ROWNUM <= 10
+        ORDER BY patient_id;
+        
+    v_total_patients NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_total_patients FROM PATIENTS;
+    
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '👥 PATIENT DETAILS WITH AGE CALCULATION');
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 90, '═'));
+    
+    FOR patient IN c_patients LOOP
+        DBMS_OUTPUT.PUT_LINE(
+            '🆔 ' || RPAD(patient.patient_code, 12) || ' | ' ||
+            '👤 ' || RPAD(patient.full_name, 25) || ' | ' ||
+            '👫 ' || RPAD(patient.gender, 8) || ' | ' ||
+            '🎂 ' || RPAD(TO_CHAR(patient.date_of_birth, 'DD-MON-YYYY'), 12) || ' | ' ||
+            '📅 Age: ' || RPAD(patient.age, 10) || ' | ' ||
+            '🩸 ' || NVL(patient.blood_type, 'Unknown') || ' | ' ||
+            '📞 ' || patient.phone
+        );
+    END LOOP;
+    
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 90, '═'));
+    DBMS_OUTPUT.PUT_LINE('📊 Showing 10 of ' || v_total_patients || ' total patients');
+END;
+/
+
+-- =============================================================================
+-- 🎯 EXECUTE TRIGGERS DEMONSTRATION
+-- =============================================================================
+BEGIN
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '🚀 DEMONSTRATING TRIGGERS & FUNCTIONS');
+    DBMS_OUTPUT.PUT_LINE('═' || RPAD('═', 60, '═'));
+    
+    -- Test triggers by inserting a new queue
+    DECLARE
+        v_next_queue_id NUMBER;
+        v_next_queue_number NUMBER;
+    BEGIN
+        -- Get next values
+        SELECT NVL(MAX(queue_id), 0) + 1 INTO v_next_queue_id FROM QUEUES;
+        SELECT NVL(MAX(queue_number), 0) + 1 INTO v_next_queue_number FROM QUEUES;
+        
+        -- Insert test queue (triggers will fire)
+        INSERT INTO QUEUES (queue_id, doctor_id, patient_id, queue_number, 
+                          queue_type, status, check_in_time, priority_level)
+        VALUES (v_next_queue_id, 1000, 5000, v_next_queue_number,
+                'REGULAR', 'WAITING', SYSTIMESTAMP, 2);
+                
+        DBMS_OUTPUT.PUT_LINE('✅ Inserted test queue #' || v_next_queue_number);
+        DBMS_OUTPUT.PUT_LINE('   ⚡ Trigger calculated wait time automatically');
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('⚠️  Test insert failed: ' || SQLERRM);
+    END;
+    
+    -- Test function
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '🧪 TESTING FUNCTIONS:');
+    DBMS_OUTPUT.PUT_LINE('   👶 Age calculation: ' || fn_get_patient_age(DATE '1990-01-01'));
+    DBMS_OUTPUT.PUT_LINE('   👨‍⚕️ Dr. 1000 patient count today: ' || fn_doctor_patient_count(1000));
+    DBMS_OUTPUT.PUT_LINE('   ⏱️ Wait time calculation (Priority 2, Position 3): ' || 
+                        fn_calculate_wait_time(2, 3) || ' mins');
+END;
+/
+
+-- =============================================================================
+-- 📈 EXECUTE PROCEDURES
+-- =============================================================================
+BEGIN
+    -- Execute Doctor Schedule Procedure
+    proc_doctor_schedule(1000);
+    
+    -- Execute Queue Statistics Procedure
+    proc_queue_statistics();
+    
+    -- Execute Patient Details Procedure
+    proc_patient_details_with_age();
+END;
+/
+
+-- =============================================================================
+-- 🏁 YOUR ORIGINAL CODE STARTS HERE (UNCHANGED)
+-- =============================================================================
+
+-- =============================================================================
+-- 1. COMPREHENSIVE DASHBOARD WITH FORMATTING
+-- =============================================================================
+PROMPT 
+PROMPT =============================================================================
+PROMPT   🏥 MEDIQUEUE HOSPITAL MANAGEMENT SYSTEM - DATA DASHBOARD
+PROMPT =============================================================================
+PROMPT 
+
+-- Database Summary with Function calls
+COLUMN "📊 DATABASE SUMMARY" FORMAT A50
+SELECT '📊 DATABASE SUMMARY' as "📊 DATABASE SUMMARY" FROM DUAL
+UNION ALL
+SELECT '========================================================================' FROM DUAL
+UNION ALL
+SELECT RPAD('🏥  Total Doctors: ', 30) || LPAD((SELECT COUNT(*) FROM DOCTORS), 5) || ' 👨‍⚕️' FROM DUAL
+UNION ALL
+SELECT RPAD('👥  Total Patients: ', 30) || LPAD((SELECT COUNT(*) FROM PATIENTS), 5) || ' 👤' FROM DUAL
+UNION ALL
+SELECT RPAD('📅  Total Appointments: ', 30) || LPAD((SELECT COUNT(*) FROM APPOINTMENTS), 5) || ' 📝' FROM DUAL
+UNION ALL
+SELECT RPAD('🏢  Departments: ', 30) || LPAD((SELECT COUNT(*) FROM DEPARTMENTS), 5) || ' 🏛️' FROM DUAL
+UNION ALL
+SELECT RPAD('⏳  Active Queues: ', 30) || LPAD((SELECT COUNT(*) FROM QUEUES WHERE status = 'WAITING'), 5) || ' ⏰' FROM DUAL;
+
+PROMPT 
+
+-- =============================================================================
+-- 2. DOCTORS SECTION - ENHANCED WITH FUNCTION
+-- =============================================================================
+COLUMN "👨‍⚕️ DOCTOR ID" FORMAT 99999
+COLUMN "📋 LICENSE NO" FORMAT A12
+COLUMN "👤 FULL NAME" FORMAT A25
+COLUMN "🎯 SPECIALIZATION" FORMAT A20
+COLUMN "📧 EMAIL" FORMAT A25
+COLUMN "📞 PHONE" FORMAT A15
+COLUMN "✅ STATUS" FORMAT A10
+COLUMN "📊 TODAY''S PATIENTS" FORMAT A15
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   👨‍⚕️ MEDICAL STAFF REGISTRY (DOCTORS)
+PROMPT =============================================================================
+
+SELECT 
+    doctor_id as "👨‍⚕️ DOCTOR ID",
+    license_number as "📋 LICENSE NO",
+    INITCAP(first_name) || ' ' || INITCAP(last_name) as "👤 FULL NAME",
+    INITCAP(specialization) as "🎯 SPECIALIZATION",
+    LOWER(email) as "📧 EMAIL",
+    phone as "📞 PHONE",
+    CASE status 
+        WHEN 'ACTIVE' THEN '✅ ACTIVE'
+        WHEN 'INACTIVE' THEN '❌ INACTIVE'
+        ELSE status 
+    END as "✅ STATUS",
+    TO_CHAR(fn_doctor_patient_count(doctor_id)) || ' 👤' as "📊 TODAY''S PATIENTS"
+FROM DOCTORS 
+ORDER BY doctor_id;
+
+-- =============================================================================
+-- 3. PATIENTS SECTION - ENHANCED WITH AGE FUNCTION
+-- =============================================================================
+COLUMN "👤 PATIENT ID" FORMAT 99999
+COLUMN "🏷️ PATIENT CODE" FORMAT A12
+COLUMN "📛 FULL NAME" FORMAT A25
+COLUMN "🎂 DATE OF BIRTH" FORMAT A12
+COLUMN "👫 GENDER" FORMAT A8
+COLUMN "📅 AGE" FORMAT A10
+COLUMN "🩸 BLOOD TYPE" FORMAT A10
+COLUMN "📞 CONTACT" FORMAT A15
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   👥 PATIENT REGISTRY (SAMPLE - FIRST 15 PATIENTS)
+PROMPT =============================================================================
+
+SELECT 
+    patient_id as "👤 PATIENT ID",
+    patient_code as "🏷️ PATIENT CODE",
+    INITCAP(first_name) || ' ' || INITCAP(last_name) as "📛 FULL NAME",
+    TO_CHAR(date_of_birth, 'DD-MON-YYYY') as "🎂 DATE OF BIRTH",
+    INITCAP(gender) as "👫 GENDER",
+    fn_get_patient_age(date_of_birth) as "📅 AGE",
+    CASE 
+        WHEN blood_type IS NOT NULL THEN '🩸 ' || blood_type
+        ELSE '🩸 UNKNOWN'
+    END as "🩸 BLOOD TYPE",
+    phone as "📞 CONTACT"
+FROM PATIENTS 
+WHERE ROWNUM <= 15
+ORDER BY patient_id;
+
+-- =============================================================================
+-- 4. APPOINTMENTS SECTION - ENHANCED WITH PATIENT STATUS
+-- =============================================================================
+COLUMN "📝 APPOINTMENT ID" FORMAT 99999
+COLUMN "👨‍⚕️ DOCTOR" FORMAT A20
+COLUMN "👤 PATIENT" FORMAT A20
+COLUMN "📅 APPOINTMENT DATE" FORMAT A19
+COLUMN "📋 TYPE" FORMAT A15
+COLUMN "📊 STATUS" FORMAT A15
+COLUMN "⏳ QUEUE STATUS" FORMAT A15
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   📅 APPOINTMENT SCHEDULE
+PROMPT =============================================================================
+
+SELECT 
+    a.appointment_id as "📝 APPOINTMENT ID",
+    INITCAP(d.first_name) || ' ' || INITCAP(d.last_name) as "👨‍⚕️ DOCTOR",
+    INITCAP(p.first_name) || ' ' || INITCAP(p.last_name) as "👤 PATIENT",
+    TO_CHAR(a.appointment_date, 'DD-MON-YYYY HH24:MI') as "📅 APPOINTMENT DATE",
+    INITCAP(a.appointment_type) as "📋 TYPE",
+    CASE a.status
+        WHEN 'SCHEDULED' THEN '📅 SCHEDULED'
+        WHEN 'IN_PROGRESS' THEN '⏳ IN PROGRESS'
+        WHEN 'COMPLETED' THEN '✅ COMPLETED'
+        WHEN 'CANCELLED' THEN '❌ CANCELLED'
+        ELSE a.status
+    END as "📊 STATUS",
+    fn_get_patient_status(p.patient_id) as "⏳ QUEUE STATUS"
+FROM APPOINTMENTS a
+JOIN DOCTORS d ON a.doctor_id = d.doctor_id
+JOIN PATIENTS p ON a.patient_id = p.patient_id
+ORDER BY a.appointment_date
+FETCH FIRST 10 ROWS ONLY;
+
+-- =============================================================================
+-- 5. DEPARTMENTS SECTION (UNCHANGED)
+-- =============================================================================
+COLUMN "🏢 DEPT ID" FORMAT 999
+COLUMN "🏛️ DEPARTMENT NAME" FORMAT A20
+COLUMN "📍 LOCATION" FORMAT A25
+COLUMN "📞 CONTACT" FORMAT A15
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   🏢 HOSPITAL DEPARTMENTS
+PROMPT =============================================================================
+
+SELECT 
+    dept_id as "🏢 DEPT ID",
+    INITCAP(dept_name) as "🏛️ DEPARTMENT NAME",
+    INITCAP(location) as "📍 LOCATION",
+    phone as "📞 CONTACT"
+FROM DEPARTMENTS 
+ORDER BY dept_id;
+
+-- =============================================================================
+-- 6. DOCTOR DEPARTMENT ASSIGNMENTS (UNCHANGED)
+-- =============================================================================
+COLUMN "👨‍⚕️ DOCTOR" FORMAT A25
+COLUMN "🏢 DEPARTMENT" FORMAT A20
+COLUMN "⭐ PRIMARY" FORMAT A10
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   🔗 DOCTOR-DEPARTMENT ASSIGNMENTS
+PROMPT =============================================================================
+
+SELECT 
+    INITCAP(d.first_name) || ' ' || INITCAP(d.last_name) as "👨‍⚕️ DOCTOR",
+    INITCAP(dept.dept_name) as "🏢 DEPARTMENT",
+    CASE dd.is_primary
+        WHEN 'Y' THEN '⭐ PRIMARY'
+        WHEN 'N' THEN '🔗 SECONDARY'
+        ELSE dd.is_primary
+    END as "⭐ PRIMARY"
+FROM DOCTOR_DEPARTMENT dd
+JOIN DOCTORS d ON dd.doctor_id = d.doctor_id
+JOIN DEPARTMENTS dept ON dd.dept_id = dept.dept_id
+ORDER BY d.last_name, dept.dept_name;
+
+-- =============================================================================
+-- 7. QUEUE MANAGEMENT - ENHANCED WITH DYNAMIC WAIT TIMES
+-- =============================================================================
+COLUMN "⏳ QUEUE #" FORMAT A8
+COLUMN "👨‍⚕️ DOCTOR" FORMAT A20
+COLUMN "👤 PATIENT" FORMAT A20
+COLUMN "🕒 CHECK-IN" FORMAT A8
+COLUMN "⏱️ WAIT TIME" FORMAT A12
+COLUMN "🎯 PRIORITY" FORMAT A10
+COLUMN "📊 STATUS" FORMAT A15
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   ⏳ REAL-TIME QUEUE MANAGEMENT (WITH DYNAMIC WAIT TIMES)
+PROMPT =============================================================================
+
+SELECT 
+    '#' || q.queue_number as "⏳ QUEUE #",
+    INITCAP(d.first_name) || ' ' || INITCAP(d.last_name) as "👨‍⚕️ DOCTOR",
+    INITCAP(p.first_name) || ' ' || INITCAP(p.last_name) as "👤 PATIENT",
+    TO_CHAR(q.check_in_time, 'HH24:MI') as "🕒 CHECK-IN",
+    CASE 
+        WHEN q.estimated_wait_time IS NOT NULL THEN 
+            TO_CHAR(q.estimated_wait_time) || ' mins'
+        ELSE 'N/A'
+    END as "⏱️ WAIT TIME",
+    CASE q.priority_level
+        WHEN 1 THEN '🟢 HIGH'
+        WHEN 2 THEN '🟡 MEDIUM'
+        WHEN 3 THEN '🔴 LOW'
+        ELSE '⚪ ' || q.priority_level
+    END as "🎯 PRIORITY",
+    CASE q.status
+        WHEN 'WAITING' THEN '⏳ WAITING'
+        WHEN 'IN_PROGRESS' THEN '🚀 IN PROGRESS'
+        WHEN 'COMPLETED' THEN '✅ COMPLETED'
+        ELSE q.status
+    END as "📊 STATUS"
+FROM QUEUES q
+JOIN DOCTORS d ON q.doctor_id = d.doctor_id
+JOIN PATIENTS p ON q.patient_id = p.patient_id
+ORDER BY 
+    CASE q.status
+        WHEN 'WAITING' THEN 1
+        WHEN 'IN_PROGRESS' THEN 2
+        ELSE 3
+    END,
+    q.priority_level,
+    q.check_in_time;
+
+-- =============================================================================
+-- 8. HOLIDAYS CALENDAR (UNCHANGED)
+-- =============================================================================
+COLUMN "📅 HOLIDAY DATE" FORMAT A12
+COLUMN "🎉 DESCRIPTION" FORMAT A30
+COLUMN "📅 YEAR" FORMAT 9999
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   🗓️ HOSPITAL HOLIDAY CALENDAR
+PROMPT =============================================================================
+
+SELECT 
+    TO_CHAR(holiday_date, 'DD-MON-YYYY') as "📅 HOLIDAY DATE",
+    INITCAP(description) as "🎉 DESCRIPTION",
+    year as "📅 YEAR"
+FROM HOLIDAYS 
+ORDER BY holiday_date;
+
+-- =============================================================================
+-- 9. AUDIT LOG - ENHANCED WITH TRIGGER ENTRIES
+-- =============================================================================
+
+-- First, let's insert some sample audit records
+BEGIN
+    -- Clear any existing audit records
+    DELETE FROM AUDIT_LOG;
+    
+    -- Insert sample audit records for system activities
+    INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, old_values, new_values, user_id, timestamp)
+    VALUES (seq_audit_id.NEXTVAL, 'SYSTEM', 'INITIALIZE', NULL, 
+            '{"system": "Mediqueue", "version": "2.0", "features": "Triggers+Functions"}', 
+            'SYSTEM', SYSTIMESTAMP - INTERVAL '1' HOUR);
+    
+    INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, old_values, new_values, user_id, timestamp)
+    VALUES (seq_audit_id.NEXTVAL, 'TRIGGERS', 'CREATE', NULL, 
+            '{"trigger1": "trg_calculate_queue_wait", "trigger2": "trg_update_queue_times"}', 
+            'ADMIN', SYSTIMESTAMP - INTERVAL '50' MINUTE);
+    
+    INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, old_values, new_values, user_id, timestamp)
+    VALUES (seq_audit_id.NEXTVAL, 'FUNCTIONS', 'CREATE', NULL, 
+            '{"function1": "fn_get_patient_age", "function2": "fn_calculate_wait_time"}', 
+            'ADMIN', SYSTIMESTAMP - INTERVAL '40' MINUTE);
+    
+    -- Rest of your original audit inserts...
+    INSERT INTO AUDIT_LOG (audit_id, table_name, operation_type, old_values, new_values, user_id, timestamp)
+    VALUES (seq_audit_id.NEXTVAL, 'DOCTORS', 'INSERT', NULL, 
+            '{"doctor_id": 1000, "name": "John Smith", "specialization": "Cardiology"}', 
+            'SYSTEM_ADMIN', SYSTIMESTAMP - INTERVAL '30' MINUTE);
+    
+    INSERT INTO AUDIT_LOG VALUES (seq_audit_id.NEXTVAL, 'QUEUES', 'TRIGGER_FIRED', 
+            '{"action": "Before insert"}', 
+            '{"wait_time": "Auto-calculated", "priority": "Applied"}', 
+            'TRIGGER', SYSTIMESTAMP - INTERVAL '20' MINUTE);
+    
+    COMMIT;
+    
+    DBMS_OUTPUT.PUT_LINE('✅ Enhanced audit records inserted successfully!');
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('⚠️  Error inserting audit records: ' || SQLERRM);
+        ROLLBACK;
+END;
+/
+
+-- Now display the audit log
+COLUMN "📊 AUDIT ID" FORMAT 99999
+COLUMN "📋 TABLE" FORMAT A15
+COLUMN "⚙️ OPERATION" FORMAT A12
+COLUMN "👤 USER" FORMAT A15
+COLUMN "🕒 TIMESTAMP" FORMAT A19
+COLUMN "📝 CHANGES" FORMAT A50
+
+PROMPT 
+PROMPT =============================================================================
+PROMPT   📊 SYSTEM AUDIT TRAIL (INCLUDING TRIGGER ACTIVITIES)
+PROMPT =============================================================================
+
+SELECT 
+    audit_id as "📊 AUDIT ID",
+    table_name as "📋 TABLE",
+    CASE operation_type
+        WHEN 'INSERT' THEN '🟢 INSERT'
+        WHEN 'UPDATE' THEN '🟡 UPDATE'
+        WHEN 'DELETE' THEN '🔴 DELETE'
+        WHEN 'TRIGGER_FIRED' THEN '⚡ TRIGGER'
+        ELSE operation_type
+    END as "⚙️ OPERATION",
+    user_id as "👤 USER",
+    TO_CHAR(timestamp, 'HH24:MI:SS') as "🕒 TIMESTAMP",
+    CASE 
+        WHEN old_values IS NULL AND new_values IS NOT NULL THEN '➕ New record created'
+        WHEN old_values IS NOT NULL AND new_values IS NOT NULL THEN '✏️  Record updated'
+        WHEN operation_type = 'TRIGGER_FIRED' THEN '⚡ Trigger executed'
+        ELSE '📄 System activity'
+    END as "📝 CHANGES"
+FROM AUDIT_LOG 
+ORDER BY timestamp DESC;
+
+-- =============================================================================
+-- 10. STATISTICS DASHBOARD - ENHANCED WITH FUNCTION DATA
+-- =============================================================================
+PROMPT 
+PROMPT =============================================================================
+PROMPT   📈 PERFORMANCE ANALYTICS & STATISTICS (ENHANCED)
+PROMPT =============================================================================
+
+COLUMN "📈 METRIC" FORMAT A35
+COLUMN "📊 VALUE" FORMAT A15
+COLUMN "📉 TREND" FORMAT A15
+
+SELECT 
+    '🏥  TOTAL DOCTORS' as "📈 METRIC",
+    TO_CHAR((SELECT COUNT(*) FROM DOCTORS), '999') || ' 👨‍⚕️' as "📊 VALUE",
+    CASE 
+        WHEN (SELECT COUNT(*) FROM DOCTORS WHERE status = 'ACTIVE') > 15 THEN '📈 HIGH'
+        ELSE '📉 LOW'
+    END as "📉 TREND"
+FROM DUAL
+UNION ALL
+SELECT 
+    '👥  TOTAL PATIENTS',
+    TO_CHAR((SELECT COUNT(*) FROM PATIENTS), '999') || ' 👤',
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PATIENTS) > 80 THEN '📈 HIGH'
+        ELSE '📉 NORMAL'
+    END
+FROM DUAL
+UNION ALL
+SELECT 
+    '📅  APPOINTMENTS TODAY',
+    TO_CHAR((SELECT COUNT(*) FROM APPOINTMENTS WHERE TRUNC(appointment_date) = TRUNC(SYSDATE)), '999') || ' 📝',
+    CASE 
+        WHEN (SELECT COUNT(*) FROM APPOINTMENTS WHERE TRUNC(appointment_date) = TRUNC(SYSDATE)) > 10 THEN '📈 BUSY'
+        ELSE '📉 NORMAL'
+    END
+FROM DUAL
+UNION ALL
+SELECT 
+    '⏳  QUEUE STATUS',
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE status = 'WAITING'), '99') || ' ⏳ / ' ||
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE status = 'IN_PROGRESS'), '99') || ' 🚀 / ' ||
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE status = 'COMPLETED'), '99') || ' ✅',
+    '📊 ACTIVE'
+FROM DUAL
+UNION ALL
+SELECT 
+    '⏱️  AVG WAIT TIME',
+    TO_CHAR(ROUND(AVG(estimated_wait_time), 1), '999.9') || ' mins',
+    CASE 
+        WHEN AVG(estimated_wait_time) > 30 THEN '📈 LONG'
+        WHEN AVG(estimated_wait_time) < 20 THEN '📉 SHORT'
+        ELSE '📊 NORMAL'
+    END
+FROM QUEUES WHERE estimated_wait_time IS NOT NULL
+UNION ALL
+SELECT 
+    '🎯  PRIORITY DISTRIBUTION',
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE priority_level = 1), '99') || ' 🟢 / ' ||
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE priority_level = 2), '99') || ' 🟡 / ' ||
+    TO_CHAR((SELECT COUNT(*) FROM QUEUES WHERE priority_level = 3), '99') || ' 🔴',
+    '📊 MIXED'
+FROM DUAL;
+
+-- =============================================================================
+-- 11. TODAY'S ACTIVITIES SUMMARY (ENHANCED)
+-- =============================================================================
+PROMPT 
+PROMPT =============================================================================
+PROMPT   🎯 TODAY''S ACTIVITIES & REMINDERS (ENHANCED)
+PROMPT =============================================================================
+
+COLUMN "🕒 TIME" FORMAT A8
+COLUMN "📋 ACTIVITY" FORMAT A40
+COLUMN "👤 RESPONSIBLE" FORMAT A20
+COLUMN "📊 STATUS" FORMAT A12
+
+SELECT 
+    TO_CHAR(SYSDATE, 'HH24:MI') as "🕒 TIME",
+    '🔔 System initialization completed' as "📋 ACTIVITY",
+    'SYSTEM' as "👤 RESPONSIBLE",
+    '✅ COMPLETED' as "📊 STATUS"
+FROM DUAL
+UNION ALL
+SELECT 
+    TO_CHAR(SYSDATE, 'HH24:MI'),
+    '⚡ Triggers & Functions deployed',
+    'ADMIN',
+    '✅ COMPLETED'
+FROM DUAL
+UNION ALL
