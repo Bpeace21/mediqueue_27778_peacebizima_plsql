@@ -50,8 +50,7 @@ The system follows a **database-centric layered architecture**:
 - **Data Layer** – Oracle 21c Pluggable Database (PDB)
 
 📸 **Screenshot Location:**  
-`screenshots/er_diagram/`
-
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/9591aeed-a1c0-40c9-bc30-f413109b04db" />
 ---
 
 ## 🗂️ Repository Structure
@@ -89,4 +88,4 @@ mediqueue_27778_peacebizima_plsql/
 -----------------------------
 -----------------------------
 ### Project Screenshots
-
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/10e32da1-ffc8-444e-886c-c4cf7af6b484" />
