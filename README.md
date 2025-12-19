@@ -88,4 +88,4 @@ mediqueue_27778_peacebizima_plsql/
 -----------------------------
 -----------------------------
 ### Project Screenshots
-<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/10e32da1-ffc8-444e-886c-c4cf7af6b484" />
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/c9afe73a-8cb3-41bb-86d9-d5ba84432617" />
