@@ -51,6 +51,8 @@ The system follows a **database-centric layered architecture**:
 
 📸 **Screenshot Location:**  
 <img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/9591aeed-a1c0-40c9-bc30-f413109b04db" />
+
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/b36dd708-6f4d-4bff-a48e-15f4edf890a4" />
 ---
 
 ## 🗂️ Repository Structure
